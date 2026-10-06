@@ -25,14 +25,25 @@ type tierDef struct {
 
 var tiers = []tierDef{{100, "bronze"}, {300, "silver"}, {600, "gold"}}
 
+type playerScore struct {
+	total     int
+	validHits int
+}
+
 // Server 是贡献分的 HTTP 处理器。
 type Server struct {
-	mu  sync.Mutex
-	log []Hit
+	mu     sync.Mutex
+	seen   map[string]bool
+	scores map[string]*playerScore
 }
 
 // NewServer 建一个空的处理器。
-func NewServer() *Server { return &Server{} }
+func NewServer() *Server {
+	return &Server{
+		seen:   make(map[string]bool),
+		scores: make(map[string]*playerScore),
+	}
+}
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
@@ -52,28 +63,27 @@ func (s *Server) handleHit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.mu.Lock()
-	s.log = append(s.log, hit)
+	// 同一个 hit_id 只计一次：重复上报（无论内容）不改变分数。
+	if !s.seen[hit.HitID] {
+		s.seen[hit.HitID] = true
+		if hit.Damage > 0 {
+			sc := s.scores[hit.Player]
+			if sc == nil {
+				sc = &playerScore{}
+				s.scores[hit.Player] = sc
+			}
+			damage := hit.Damage
+			if damage > DamageCap {
+				damage = DamageCap
+			}
+			// 阶段累计：分数跨阶段累加，不按阶段清零。
+			sc.total += damage
+			sc.validHits++
+		}
+	}
 	s.mu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-}
-
-func (s *Server) replay(player string) (int, int) {
-	total := 0
-	phase := -1
-	scanned := 0
-	for _, hit := range s.log {
-		scanned++
-		if hit.Player != player {
-			continue
-		}
-		if hit.Phase != phase {
-			total = 0
-			phase = hit.Phase
-		}
-		total += hit.Damage
-	}
-	return total, scanned
 }
 
 func tierOf(total int) string {
@@ -89,7 +99,15 @@ func tierOf(total int) string {
 func (s *Server) handleContrib(w http.ResponseWriter, r *http.Request) {
 	player := r.URL.Query().Get("player")
 	s.mu.Lock()
-	total, scanned := s.replay(player)
+	// 查询只需读一条玩家聚合记录，scanned 与上报总条数无关。
+	scanned := 1
+	total := 0
+	if sc := s.scores[player]; sc != nil {
+		total = sc.total
+		if total > sc.validHits*DamageCap {
+			total = sc.validHits * DamageCap
+		}
+	}
 	s.mu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
