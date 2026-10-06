@@ -27,12 +27,18 @@ var tiers = []tierDef{{100, "bronze"}, {300, "silver"}, {600, "gold"}}
 
 // Server 是贡献分的 HTTP 处理器。
 type Server struct {
-	mu  sync.Mutex
-	log []Hit
+	mu     sync.Mutex
+	seen   map[string]struct{}
+	totals map[string]int
 }
 
 // NewServer 建一个空的处理器。
-func NewServer() *Server { return &Server{} }
+func NewServer() *Server {
+	return &Server{
+		seen:   make(map[string]struct{}),
+		totals: make(map[string]int),
+	}
+}
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
@@ -52,28 +58,19 @@ func (s *Server) handleHit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.mu.Lock()
-	s.log = append(s.log, hit)
+	if hit.Damage > 0 {
+		if _, dup := s.seen[hit.HitID]; !dup {
+			s.seen[hit.HitID] = struct{}{}
+			damage := hit.Damage
+			if damage > DamageCap {
+				damage = DamageCap
+			}
+			s.totals[hit.Player] += damage
+		}
+	}
 	s.mu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-}
-
-func (s *Server) replay(player string) (int, int) {
-	total := 0
-	phase := -1
-	scanned := 0
-	for _, hit := range s.log {
-		scanned++
-		if hit.Player != player {
-			continue
-		}
-		if hit.Phase != phase {
-			total = 0
-			phase = hit.Phase
-		}
-		total += hit.Damage
-	}
-	return total, scanned
 }
 
 func tierOf(total int) string {
@@ -89,13 +86,13 @@ func tierOf(total int) string {
 func (s *Server) handleContrib(w http.ResponseWriter, r *http.Request) {
 	player := r.URL.Query().Get("player")
 	s.mu.Lock()
-	total, scanned := s.replay(player)
+	total := s.totals[player]
 	s.mu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
 		"player":  player,
 		"total":   total,
 		"tier":    tierOf(total),
-		"scanned": scanned,
+		"scanned": 1,
 	})
 }
